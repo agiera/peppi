@@ -94,6 +94,7 @@ pub struct ParseState {
 	event_counts: HashMap<u8, usize>,
 	split_accumulator: SplitAccumulator,
 	port_indexes: [usize; 4],
+	skipping_frames: bool,
 	game: PartialGame,
 }
 
@@ -651,6 +652,7 @@ pub fn parse_start<R: Read>(mut r: R, opts: Option<&Opts>) -> Result<ParseState>
 		game,
 		port_indexes,
 		split_accumulator: Default::default(),
+		skipping_frames: false,
 	})
 }
 
@@ -668,6 +670,18 @@ fn push_offset<T>(offsets: &mut Option<Offsets<i32>>, new_len: i32) {
 /// Returns the event code that was parsed.
 pub fn parse_event<R: Read>(mut r: R, state: &mut ParseState, opts: Option<&Opts>) -> Result<u8> {
 	let mut code = r.read_u8()?;
+
+	if state.skipping_frames && code != Event::GameEnd as u8 {
+		warn!("Missing end event");
+		let size = state.payload_sizes[Event::GameEnd as usize]
+			.expect("Missing GameEnd in playload sizes")
+			.get() as usize;
+		let mut buf = vec![0; size];
+		r.read_exact(&mut buf)?;
+		state.bytes_read += size + 1; // +1 byte for the event code
+		return Ok(0);
+	}
+
 	debug!("Event {:#02x} @{:#x}", code, state.bytes_read);
 
 	let size = state.payload_sizes[code as usize]
@@ -946,7 +960,9 @@ pub fn read<R: Read + Seek>(r: R, opts: Option<&Opts>) -> Result<Game> {
 
 	if opts.map_or(false, |o| o.skip_frames) {
 		// Skip to GameEnd, which we assume is the last event in the stream!
-		let end_offset = 1 + state.payload_sizes[Event::GameEnd as usize].unwrap().get() as usize;
+		let end_offset = 1 + state.payload_sizes[Event::GameEnd as usize]
+			.expect("Missing GameEnd in payload sizes")
+			.get() as usize;
 		if raw_len == 0 || raw_len - state.bytes_read < end_offset {
 			return Err(err!(
 				"Cannot skip to game end. Replay in-progress or corrupted."
@@ -963,6 +979,7 @@ pub fn read<R: Read + Seek>(r: R, opts: Option<&Opts>) -> Result<Game> {
 			))?;
 		}
 		state.bytes_read += skip;
+		state.skipping_frames = true;
 	}
 
 	// Main event loop. `raw_len` will be 0 for an in-progress replay.
